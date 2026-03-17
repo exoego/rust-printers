@@ -1,5 +1,5 @@
 use libc::{c_char, c_int, time_t};
-use std::{os::raw::c_void, ptr, slice, time::SystemTime};
+use std::{os::raw::c_void, ptr, slice, thread, time::Duration, time::SystemTime};
 
 use crate::{
     common::{
@@ -21,6 +21,14 @@ const CUPS_IPP_OP_HOLD_JOB: c_int = 12;
 const CUPS_IPP_OP_CANCEL_JOB: c_int = 8;
 const CUPS_IPP_OP_RELEASE_JOB: c_int = 13;
 const CUPS_IPP_OP_RESTART_JOB: c_int = 14;
+
+const CUPS_JOB_STATE_PENDING: c_int = 3;
+const CUPS_JOB_STATE_HELD: c_int = 4;
+const CUPS_JOB_STATE_PROCESSING: c_int = 5;
+const CUPS_JOB_STATE_STOPPED: c_int = 6;
+const CUPS_JOB_STATE_CANCELLED: c_int = 7;
+const CUPS_JOB_STATE_ABORTED: c_int = 8;
+const CUPS_JOB_STATE_COMPLETED: c_int = 9;
 
 #[link(name = "cups")]
 unsafe extern "C" {
@@ -177,9 +185,73 @@ pub fn print_file(
         if result == 0 {
             Err(PrintersError::print_error("cupsPrintFile"))
         } else {
-            Ok(result as u64)
+            let job_id = result;
+            verify_job_submitted(printer_name, job_id)?;
+            Ok(job_id as u64)
         }
     }
+}
+
+/**
+ * Verify the submitted job was not immediately held or rejected by CUPS.
+ *
+ * `cupsPrintFile` returns success when the job is queued locally,
+ * even if the backend (e.g. SMB) fails authentication immediately.
+ * This function detects such cases by polling the job state briefly.
+ */
+fn verify_job_submitted(printer_name: &str, job_id: c_int) -> Result<(), PrintersError> {
+    let name = str_to_cstring(printer_name);
+
+    for _ in 0..5 {
+        thread::sleep(Duration::from_millis(200));
+
+        let mut jobs_ptr: *mut CupsJobsS = std::ptr::null_mut();
+        let jobs_count = unsafe { cupsGetJobs(&mut jobs_ptr, name.as_ptr(), 0, 0) };
+
+        if jobs_count <= 0 {
+            // No active jobs — the job already completed or was consumed. Assume success.
+            return Ok(());
+        }
+
+        let jobs = unsafe { slice::from_raw_parts(jobs_ptr, jobs_count as usize) };
+        let target = jobs.iter().find(|j| j.id == job_id);
+
+        match target {
+            None => {
+                // Job not in active queue — already completed. Success.
+                return Ok(());
+            }
+            Some(job) => match job.state {
+                CUPS_JOB_STATE_HELD | CUPS_JOB_STATE_STOPPED => {
+                    return Err(PrintersError::print_error(format!(
+                        "CUPS job {job_id} held/stopped (state={}). \
+                         Check printer authentication or connectivity.",
+                        job.state
+                    )));
+                }
+                CUPS_JOB_STATE_CANCELLED | CUPS_JOB_STATE_ABORTED => {
+                    return Err(PrintersError::print_error(format!(
+                        "CUPS job {job_id} cancelled/aborted (state={})",
+                        job.state
+                    )));
+                }
+                CUPS_JOB_STATE_PROCESSING | CUPS_JOB_STATE_COMPLETED => {
+                    // Job is being processed or already completed. Success.
+                    return Ok(());
+                }
+                CUPS_JOB_STATE_PENDING => {
+                    // CUPS hasn't attempted the backend yet. Keep polling.
+                }
+                _ => {
+                    // Unknown state — treat as success to avoid false negatives.
+                    return Ok(());
+                }
+            },
+        }
+    }
+
+    // Still PENDING after ~1s — CUPS accepted and didn't reject it. Assume success.
+    Ok(())
 }
 
 /**
